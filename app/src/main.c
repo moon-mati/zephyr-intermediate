@@ -1,81 +1,99 @@
+#include <stdbool.h>
+#include <stdint.h>
+
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
 LOG_MODULE_REGISTER(demo, LOG_LEVEL_INF);
 
 #define STACK_SIZE 1024
+#define WORKER_PRIORITY 5
+#define WORKER_COUNT 2
+#define INCREMENTS 10000U
+#define ROUNDS 3U
+#define EXPECTED_COUNT (WORKER_COUNT * INCREMENTS)
 
-#define PRIO_LOW 7
-#define PRIO_MED 5
-#define PRIO_HIGH 3
-#define PRIO_COOP -1
+K_THREAD_STACK_ARRAY_DEFINE(worker_stacks, WORKER_COUNT, STACK_SIZE);
+static struct k_thread workers[WORKER_COUNT];
+K_MUTEX_DEFINE(counter_mutex);
 
-void t_low_fn(void *p1, void *p2, void *p3) {
-  ARG_UNUSED(p1);
-  ARG_UNUSED(p2);
-  ARG_UNUSED(p3);
+/* volatile makes accesses visible; it does not make an increment atomic. */
+static volatile uint32_t counter;
 
-  while (1) {
-    LOG_INF("T_LOW running");
-    k_sleep(K_MSEC(300));
-  }
+static void increment_counter(void *p1, void *p2, void *p3)
+{
+	const bool use_mutex = *(const bool *)p1;
+
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	for (uint32_t i = 0; i < INCREMENTS; i++) {
+		if (use_mutex) {
+			k_mutex_lock(&counter_mutex, K_FOREVER);
+		}
+
+		uint32_t value = counter;
+
+		/* Expose the read/modify/write race, even on a single CPU. */
+		k_yield();
+		counter = value + 1U;
+
+		if (use_mutex) {
+			k_mutex_unlock(&counter_mutex);
+		}
+	}
 }
 
-void t_med_fn(void *p1, void *p2, void *p3) {
-  ARG_UNUSED(p1);
-  ARG_UNUSED(p2);
-  ARG_UNUSED(p3);
+static uint32_t run_round(bool use_mutex)
+{
+	counter = 0;
 
-  while (1) {
-    LOG_INF("T_MED running");
-    k_sleep(K_MSEC(200));
-  }
+	/* Create both workers before allowing either to run. */
+	for (int i = 0; i < WORKER_COUNT; i++) {
+		k_thread_create(&workers[i], worker_stacks[i],
+				K_THREAD_STACK_SIZEOF(worker_stacks[i]),
+				increment_counter, &use_mutex, NULL, NULL,
+				WORKER_PRIORITY, 0, K_FOREVER);
+		k_thread_name_set(&workers[i], i == 0 ? "counter_a" : "counter_b");
+	}
+
+	for (int i = 0; i < WORKER_COUNT; i++) {
+		k_thread_start(&workers[i]);
+	}
+
+	/*
+	 * Join before reading the result or reusing thread objects and stacks.
+	 * This also keeps use_mutex alive until both workers have finished.
+	 */
+	for (int i = 0; i < WORKER_COUNT; i++) {
+		k_thread_join(&workers[i], K_FOREVER);
+	}
+
+	return counter;
 }
 
-void t_high_fn(void *p1, void *p2, void *p3) {
-  ARG_UNUSED(p1);
-  ARG_UNUSED(p2);
-  ARG_UNUSED(p3);
+int main(void)
+{
+	LOG_INF("Two workers, priority %d, %u increments each",
+		WORKER_PRIORITY, INCREMENTS);
 
-  while (1) {
-    LOG_INF("T_HIGH running");
-    k_sleep(K_MSEC(100));
-  }
-}
+	for (int phase = 0; phase < 2; phase++) {
+		bool use_mutex = (phase == 1);
 
-void t_coop_fn(void *p1, void *p2, void *p3) {
-  ARG_UNUSED(p1);
-  ARG_UNUSED(p2);
-  ARG_UNUSED(p3);
-  /* Aquí K_SECONDS() es válido porque k_sleep() recibe k_timeout_t. */
-  k_sleep(K_SECONDS(5));
-  while (1) {
-    for (int iteration = 1; iteration <= 5; iteration++) {
-      LOG_INF("T_COOP busy iteration %d", iteration);
+		for (unsigned int round = 1; round <= ROUNDS; round++) {
+			uint32_t actual = run_round(use_mutex);
 
-      /*
-       * Trabajo activo: el hilo conserva la CPU y no entra
-       * en estado Waiting.
-       */
-      k_busy_wait(50000);
-    }
+			LOG_INF("%s round %u: expected=%u actual=%u lost=%u",
+				use_mutex ? "mutex" : "unprotected", round,
+				EXPECTED_COUNT, actual, EXPECTED_COUNT - actual);
 
-    LOG_INF("T_COOP yielding");
-    k_yield();
-  }
-}
+			if (use_mutex && actual != EXPECTED_COUNT) {
+				LOG_ERR("Mutex verification failed");
+				return 1;
+			}
+		}
+	}
 
-K_THREAD_DEFINE(t_low, STACK_SIZE, t_low_fn, NULL, NULL, NULL, PRIO_LOW, 0, 0);
-
-K_THREAD_DEFINE(t_med, STACK_SIZE, t_med_fn, NULL, NULL, NULL, PRIO_MED, 0, 0);
-
-K_THREAD_DEFINE(t_high, STACK_SIZE, t_high_fn, NULL, NULL, NULL, PRIO_HIGH, 0,
-                0);
-
-K_THREAD_DEFINE(t_coop, STACK_SIZE, t_coop_fn, NULL, NULL, NULL, PRIO_COOP, 0,
-                0);
-
-int main(void) {
-  LOG_INF("Thread scheduling demonstration started");
-  return 0;
+	LOG_INF("Race condition demonstration complete");
+	return 0;
 }
