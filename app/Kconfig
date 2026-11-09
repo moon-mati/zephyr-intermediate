@@ -1,1 +1,8 @@
 source "Kconfig.zephyr"
+
+config HOMEWORK_DEBOUNCE
+	bool "Debounce five sensor events into one work handler call"
+	default n
+	help
+	  Generate ten bursts of five edges within 20 ms. Each edge reschedules
+	  delayable work for 30 ms later, so the handler runs once per burst.
