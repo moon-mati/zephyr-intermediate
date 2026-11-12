@@ -1,1 +1,8 @@
 source "Kconfig.zephyr"
+
+config HOMEWORK_STUCK_CONSUMER
+	bool "Simulate a stuck consumer after three processed samples"
+	default y
+	help
+	  Sleep for 2500 ms in the consumer without feeding its 1500 ms task
+	  watchdog. The producer continues filling an eight-sample queue.

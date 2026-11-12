@@ -16,6 +16,8 @@ Make sure to select appropriate OS and to perform all steps till
 
 ## Lecture 4 - Task 1: sistema de sensores con zbus
 
+Este apartado describe el tag `l4-task1`. La versión actual se explica en Lecture 5.
+
 La aplicación parte del ejemplo `l4-demo2` y conecta un productor con dos
 observadores mediante un único canal, `sensor_chan`.
 
@@ -77,3 +79,106 @@ redondeo del timeout al tick siguiente. El sensor terminó a los 1800 ms y el
 logger a los 6067 ms: el retraso del logger no frenó las publicaciones.
 
 Tag de entrega: `l4-task1`.
+
+## Lecture 5 - Task 1: fiabilidad bajo presión
+
+La rama `l5-homework` parte del tag `l4-task1`. Conserva el canal de sensores
+zbus, el productor periódico y el listener de display. Para medir la presión,
+la entrega al consumidor ahora pasa por una `k_msgq` de ocho muestras: otro
+listener copia el mensaje con `K_NO_WAIT`. Si la cola está llena, descarta la
+muestra nueva y registra su secuencia; el productor sigue publicando cada 100 ms.
+
+```mermaid
+flowchart LR
+    P[Productor: 100 ms] --> Z[Canal zbus]
+    Z --> D[Listener de display]
+    Z --> L[Listener de cola]
+    L --> Q[Cola: 8 muestras]
+    Q --> C[Consumidor: 50 ms]
+    H[Hilo de salud] -->|consulta ocupación| Q
+    C -->|al completar una muestra| W[Task watchdog: 1500 ms]
+    W -->|vence el plazo| CB[Callback en ISR]
+```
+
+### Watchdog y fallo simulado
+
+`main()` llama a `task_wdt_init(NULL)` antes de iniciar los hilos. El consumidor
+registra un canal con `task_wdt_add()` y lo alimenta con `task_wdt_feed()`
+únicamente después de terminar una muestra. El hilo de salud nunca alimenta
+ese watchdog.
+
+Por defecto, después de procesar tres muestras, el consumidor ejecuta
+`k_sleep(K_MSEC(2500))`. Durante esa pausa deja de consumir y de alimentar
+el watchdog, mientras el productor continúa. El plazo de 1500 ms permite
+observar primero la acumulación y luego el callback con la cola llena.
+
+El callback se ejecuta en contexto de interrupción: solo guarda estadísticas
+atómicas y emite un log diferido. Esta demostración usa el watchdog de software
+sin respaldo hardware y registra el fallo sin reiniciar el sistema. El consumidor
+retoma su trabajo cuando termina el sleep simulado; el callback no lo despierta.
+Al finalizar, el consumidor elimina su canal de watchdog.
+
+### Monitor de salud
+
+El hilo de salud consulta `k_msgq_num_used_get()` aproximadamente cada 100 ms.
+Registra el nivel de ocupación y emite una advertencia al alcanzar el 75 %
+(`6/8`). Advierte al entrar en ese rango y vuelve a habilitar la advertencia
+cuando la ocupación cae por debajo del umbral.
+
+### Compilar y verificar
+
+Con el entorno de Zephyr del workspace activado, desde este repositorio:
+
+```sh
+west build -d build/l5-task1 -b native_sim/native/64 app -- -DZEPHYR_TOOLCHAIN_VARIANT=host
+python3 tests/verify_l5.py build/l5-task1/zephyr/zephyr.exe --mode stuck
+```
+
+El verificador ejecuta seis segundos de simulación, guarda el log completo en
+`build/l5-task1/l5-stuck.log` y comprueba el periodo del productor, las secuencias
+aceptadas y descartadas, la advertencia al 75 %, el orden de los eventos y el
+callback a los 1500 ms de la última muestra completada.
+
+Para observar todo el log directamente:
+
+```sh
+./build/l5-task1/zephyr/zephyr.exe -stop_at=6
+```
+
+### Resultado medido con bloqueo
+
+| Tiempo | Observación |
+| --- | --- |
+| 351 ms | El consumidor termina su tercera muestra y comienza el sleep de 2500 ms. |
+| 909 ms | El monitor advierte: cola al 75 %, `6/8`. |
+| 1111 ms | El monitor observa la cola al 100 %, `8/8`. |
+| 1200 ms | Se descarta la primera muestra nueva, secuencia 11. |
+| 1851 ms | Vence el watchdog y se ejecuta el callback en ISR con la cola `8/8`. |
+| 2852 ms | El consumidor retoma el procesamiento. |
+| 4051 ms | Termina la demostración y se comprueban las estadísticas. |
+
+```text
+[SUMMARY] published=40 displayed=40 queued=23 processed=23 dropped=17
+[SUMMARY] peak=8/8 warnings=1 watchdogs=1 watchdog_tick=1851
+[SUMMARY] verification passed
+```
+
+Las 40 publicaciones mantuvieron intervalos de exactamente 100 ms. El display
+recibió las 40 y el consumidor procesó, en orden, las 23 que entraron en la cola.
+Las otras 17 se descartaron únicamente cuando la cola estaba llena.
+
+### Control sin bloqueo
+
+`app/healthy.conf` desactiva `CONFIG_HOMEWORK_STUCK_CONSUMER` para repetir la
+misma pipeline sin el fallo simulado:
+
+```sh
+west build -d build/l5-healthy -b native_sim/native/64 app -- -DZEPHYR_TOOLCHAIN_VARIANT=host -DEXTRA_CONF_FILE=healthy.conf
+python3 tests/verify_l5.py build/l5-healthy/zephyr/zephyr.exe --mode healthy
+```
+
+Resultado medido: 40 publicadas, 40 mostradas, 40 procesadas, cero pérdidas,
+cero advertencias y cero callbacks del watchdog. La ocupación observada es
+`0/8` porque el consumidor está esperando y recibe cada muestra directamente.
+
+Tag de entrega: `l5-task1`.
